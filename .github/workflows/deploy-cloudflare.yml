@@ -166,8 +166,63 @@ jobs:
           echo "${{ steps.r2.outputs.url }}" | pnpm exec wrangler secret put PUBLIC_IMAGES_URL
           echo "Set PUBLIC_IMAGES_URL = ${{ steps.r2.outputs.url }}"
 
+      # The release's wrangler.toml pins CACHE_KV to a namespace in the upstream
+      # Cloudflare account, which a fork's account cannot bind. Provision a KV
+      # namespace in this account (idempotent, matched by title) and patch its id
+      # into the top-level [[kv_namespaces]] block below.
+      - name: Ensure KV cache namespace exists
+        id: kv
+        env:
+          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          KV_TITLE: zpan-cache
+        run: |
+          API="https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/storage/kv/namespaces"
+          KV_ID=""
+          PAGE=1
+          while [ -z "$KV_ID" ]; do
+            RESP=$(curl -sf "$API?per_page=100&page=$PAGE" -H "Authorization: Bearer $CF_API_TOKEN") || {
+              echo "::error::Failed to list KV namespaces. Make sure CLOUDFLARE_API_TOKEN has 'Workers KV Storage: Edit' scope."
+              exit 1
+            }
+            KV_ID=$(echo "$RESP" | jq -r --arg t "$KV_TITLE" '.result[]? | select(.title == $t) | .id' | head -n1)
+            COUNT=$(echo "$RESP" | jq -r '.result | length')
+            [ "$COUNT" -lt 100 ] && break
+            PAGE=$((PAGE + 1))
+          done
+          if [ -z "$KV_ID" ]; then
+            KV_ID=$(curl -sf -X POST "$API" \
+              -H "Authorization: Bearer $CF_API_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{\"title\": \"$KV_TITLE\"}" | jq -r '.result.id') || true
+            if [ -z "$KV_ID" ] || [ "$KV_ID" = "null" ]; then
+              echo "::error::Failed to create KV namespace $KV_TITLE. Make sure CLOUDFLARE_API_TOKEN has 'Workers KV Storage: Edit' scope."
+              exit 1
+            fi
+            echo "Created KV namespace: $KV_TITLE ($KV_ID)"
+          else
+            echo "Reusing KV namespace: $KV_TITLE ($KV_ID)"
+          fi
+          echo "id=$KV_ID" >> "$GITHUB_OUTPUT"
+
       - name: Patch wrangler.toml with D1 database ID
         run: sed -i "s/database_id = \"[^\"]*\"/database_id = \"${{ steps.d1.outputs.id }}\"/" wrangler.toml
+
+      - name: Patch wrangler.toml with KV namespace ID
+        env:
+          KV_ID: ${{ steps.kv.outputs.id }}
+        run: |
+          # Only the top-level [[kv_namespaces]] block belongs to production;
+          # leave env/preview-scoped blocks untouched.
+          awk -v id="$KV_ID" '
+            /^\[\[kv_namespaces\]\]$/ { inblock = 1; print; next }
+            /^\[/ { inblock = 0 }
+            inblock && /^id[[:space:]]*=/ { print "id = \"" id "\""; inblock = 0; patched++; next }
+            { print }
+            END { if (patched != 1) { print "expected exactly one top-level CACHE_KV id, patched " patched + 0 > "/dev/stderr"; exit 1 } }
+          ' wrangler.toml > wrangler.toml.new
+          mv wrangler.toml.new wrangler.toml
+          grep -n -A2 '^\[\[kv_namespaces\]\]' wrangler.toml
 
       - name: Set BETTER_AUTH_SECRET (first deploy only)
         env:
