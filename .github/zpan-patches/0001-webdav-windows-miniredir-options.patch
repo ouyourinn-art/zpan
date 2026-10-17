@@ -1,0 +1,29 @@
+diff --git a/server/http/webdav.ts b/server/http/webdav.ts
+index 4be491b..4070b5a 100644
+--- a/server/http/webdav.ts
++++ b/server/http/webdav.ts
+@@ -671,7 +671,24 @@ app.use('*', async (c, next) => {
+   await next()
+ })
+ 
++// The Windows WebDAV mini-redirector ("Map network drive") probes the share with an
++// unauthenticated OPTIONS request and gives up without ever prompting for credentials
++// unless that probe advertises WebDAV support. Answer only that capability probe
++// anonymously; it reveals no user data, and every other method still requires a key.
++// Other clients (and the domain verification probe) keep receiving the auth challenge.
++const WINDOWS_MINIREDIR_UA = /^Microsoft-WebDAV-MiniRedir\//i
++
+ app.use('*', async (c, next) => {
++  if (c.req.method.toUpperCase() === 'OPTIONS' && WINDOWS_MINIREDIR_UA.test(c.req.header('User-Agent') ?? '')) {
++    return new Response(null, {
++      status: 200,
++      headers: {
++        Allow: 'OPTIONS, PROPFIND, PROPPATCH, GET, HEAD, PUT, DELETE, MKCOL, MOVE, COPY, LOCK, UNLOCK',
++        DAV: '1, 2',
++        'MS-Author-Via': 'DAV',
++      },
++    })
++  }
+   const auth = await requireWebDavApiKey(c)
+   if (auth instanceof Response) return auth
+   await next()
